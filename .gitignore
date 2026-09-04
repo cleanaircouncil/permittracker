@@ -139,3 +139,5 @@ dist
 dev
 .astro
 .DS_Store
+# Local Netlify folder
+.netlify
