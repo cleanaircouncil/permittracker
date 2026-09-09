@@ -24,79 +24,77 @@ export const EchoStatus = {
   TERMINATED: "Terminated"
 }
 
-async function getAll( base, ids ) {
-  const results = [];
-  for( const id of ids ) {
-    const data = await airtableAPI.get( `${base}/${id}` )
-    results.push(data);
-  }
+// Fetch an entire Airtable table once, following offset pagination.
+// Returns a Map keyed by record id so linked records can be hydrated in memory
+// instead of one HTTP request per linked id.
+async function getTableById( table ) {
+  const records = new Map();
+  let offset;
 
-  return results;
+  do {
+    const query = offset ? `?offset=${encodeURIComponent(offset)}` : "";
+    const page = await airtableAPI.get( `${encodeURIComponent(table)}${query}` );
+    for( const record of page.records ) records.set( record.id, record );
+    offset = page.offset;
+  } while( offset );
+
+  return records;
 }
 
 
-async function getDEPData( ids ) {
-  const data = await getAll( Bases.DEP, ids );
-  const results = data.map( datum => {
-    const json = jsonify(datum);
-
-    return json;
-  })
-
-  return results;
-}
-
-async function getECHOData( ids ) {
-  const data = await getAll( Bases.ECHO, ids );
-  const results = data.map( datum => {
-    const json = jsonify(datum);
-    delete json.name;
-    delete json.facility;
-
-    return json;
-  })
-
-  return results;
+function getDEPData( ids, table ) {
+  return ids
+    .map( id => table.get(id) )
+    .filter( Boolean )
+    .map( record => jsonify(record) );
 }
 
 
-async function getAttachments( ids ) {
-  const data = await getAll( Bases.ATTACHMENTS, ids );
-  const results = data.map( datum => {
-    return jsonify(datum);
-  });
-
-  return results;
+function getECHOData( ids, table ) {
+  return ids
+    .map( id => table.get(id) )
+    .filter( Boolean )
+    .map( record => {
+      const json = jsonify(record);
+      delete json.name;
+      delete json.facility;
+      return json;
+    });
 }
 
 
-async function recordToFacility(record) {
+function getAttachments( ids, table ) {
+  return ids
+    .map( id => table.get(id) )
+    .filter( Boolean )
+    .map( record => jsonify(record) );
+}
+
+
+function recordToFacility(record, tables) {
   const facility = jsonify(record);
 
   console.log( `🏭 ${facility.company_name.trim()}`);
 
   facility.slug = slugify(facility.company_name);
-  
+
   if( facility.attachments ) {
     console.log(`  📎 Hydrating attachments from Airtable...`);
-    const attachments = await getAttachments(facility.attachments || []);
-    facility.attachments = attachments;
+    facility.attachments = getAttachments(facility.attachments || [], tables.attachments);
   }
 
   if( facility.echo_compliance ) {
     console.log(`  📋 Hydrating compliance data from EPA...`);
-    const echo_compliance = await getECHOData( facility.echo_compliance );
-    facility.echo_compliance = echo_compliance; 
+    facility.echo_compliance = getECHOData( facility.echo_compliance, tables.echo );
   }
 
   if( facility.dep_violations ) {
     console.log(`  🚨 Hydrating violation info from DEP...`);
-    const data = await getDEPData( facility.dep_violations );
-    const dep_violations = {
-      violation_count: data.at(0).violation_count,
-      since: data.at(0).since
+    const dep = getDEPData( facility.dep_violations, tables.dep );
+    facility.dep_violations = {
+      violation_count: dep.at(0)?.violation_count,
+      since: dep.at(0)?.since
     }
-    facility.dep_violations = dep_violations;
   }
 
   if( facility.clean_air_notes ) {
@@ -108,10 +106,10 @@ async function recordToFacility(record) {
     facility.notes = marked.parse(facility.notes);
     console.log(`  ✏️  Rendering Facility Notes to HTML...`);
   }
-  
+
   if( facility.echo_compliance?.length > 0 && facility.echo_compliance.some( permit => permit.status == EchoStatus.VIOLATION ) )
     facility.alert = true;
-  
+
   if( facility.echo_compliance?.length > 0 ) {
     const formatter = new Intl.NumberFormat("en-US", {
       style: "currency",
@@ -134,7 +132,7 @@ function produceMapData( data ) {
 
   const points = turf.featureCollection( data.facilities.map( facility => turf.point([ facility.longitude, facility.latitude ])));
   const bounds = turf.bbox(points);
-  
+
   const result = {
     map: {
       bounds
@@ -145,34 +143,35 @@ function produceMapData( data ) {
   return result;
 }
 
+async function getFacilities() {
+  const records = [];
+  await base('Facilities').select().eachPage( (page, fetchNextPage) => {
+    records.push( ...page );
+    fetchNextPage();
+  });
+  return records;
+}
+
+
 console.log( "✈️  Querying Airtable...")
 
+const [ facilities, attachments, echo, dep ] = await Promise.all([
+  getFacilities(),
+  getTableById( Bases.ATTACHMENTS ),
+  getTableById( Bases.ECHO ),
+  getTableById( Bases.DEP ),
+]);
 
+const tables = { attachments, echo, dep };
 
-base('Facilities')
-  .select()
-  .eachPage( async function page (records, fetchNextPage) {
-    for( const record of records ) {
-      const facility = await recordToFacility(record);
-      data.facilities.push( facility );
-    }
+data.facilities = facilities.map( record => recordToFacility(record, tables) );
+data.facilities.sort((a, b) => a.company_name.toLowerCase() < b.company_name.toLowerCase() ? -1 : 1 );
 
-    fetchNextPage();
-  }, async function done(error) {
-    if(error) {
-      console.error(error);
-    }  
+console.log( "💾 Writing data.json...")
+fs.writeFileSync("./src/data/data.json", JSON.stringify( data, null, 2 ));
 
-    data.facilities.sort((a, b) => a.company_name.toLowerCase() < b.company_name.toLowerCase() ? -1 : 1 )
-    
+const mapData = produceMapData(data);
+console.log( "💾 Writing map-data.json...")
+fs.writeFileSync("./src/data/map-data.json", JSON.stringify( mapData ));
 
-    console.log( "💾 Writing data.json...")
-    fs.writeFileSync("./src/data/data.json", JSON.stringify( data, null, 2 ));
-
-
-    const mapData = produceMapData(data);
-    console.log( "💾 Writing map-data.json...")
-    fs.writeFileSync("./src/data/map-data.json", JSON.stringify( mapData ));
-
-    console.log("✅ Done!")
-  })
+console.log("✅ Done!")
