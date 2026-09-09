@@ -9,10 +9,10 @@ async function rebuildSite(triggerTitle) {
 export default async (req) => {
   const { next_run } = await req.json();
 
-  await rebuildSite("Hourly rebuild");
+  await rebuildSite("Two-hourly rebuild");
   console.log("Received event! Next invocation at:", next_run);
 };
 
 export const config = {
-  schedule: "@hourly",
+  schedule: "0 */2 * * *",
 };
